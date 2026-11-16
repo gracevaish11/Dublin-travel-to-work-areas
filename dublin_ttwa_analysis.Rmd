@@ -1,0 +1,165 @@
+---
+title: "Dublin Travel-to-Work Areas: Coombes and Bond Clustering"
+author: "Vaishnavi Rajput"
+date: "2025-04-08"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Introduction
+
+In this project I analyse commuting patterns in the Dublin region using a dataset of travel-to-work flows between electoral divisions (EDs). The aim is to delineate the most prominent areas of employment concentration and residential density, known as Travel-to-Work Areas (TTWAs).
+
+To do this I apply the Coombes and Bond method, which clusters regions according to their commuting interconnections. It is implemented in the `LabourMarketAreas` R package and is well suited to delineating functional areas from real commuting data.
+
+```{r libraries}
+library(tidyverse)
+library(sf)
+library(ggplot2)
+library(tmap)
+library(ggrepel)
+library(LabourMarketAreas)
+```
+
+## Data
+
+- `dublin_trips.csv`: counts of people travelling between Dublin EDs. `community_live` is where people live, `community_work` is where they travel to for work, and `amount` is how many people make that trip.
+- `lookup.csv`: matches each community ID code with its ED name.
+- `dub_eds.geojson`: ED boundaries, used for spatial visualisation.
+
+```{r data}
+# Travel-to-work flows between EDs
+dub_trips <- read_csv("data/dublin_trips.csv")
+head(dub_trips)
+
+# Lookup of community codes to ED names
+lookup <- read_csv("data/lookup.csv")
+head(lookup)
+
+# ED boundaries
+dub <- st_read("data/dub_eds.geojson", quiet = TRUE)
+head(dub)
+
+# Base map of Dublin electoral divisions
+ggplot(dub) + geom_sf()
+```
+
+## Where people work
+
+To understand where people travel to for work, I group the trips by destination ED (`community_work`) and sum the number of commuters heading to each one. I rename `community_work` to `community` so it can be joined to the ED boundaries, then map the result.
+
+```{r work-trips}
+work_trips <- dub_trips %>%
+  group_by(community_work) %>%
+  summarise(amount = sum(amount)) %>%
+  rename(community = community_work)
+
+head(work_trips)
+
+dub <- dub %>% left_join(work_trips, by = "community")
+
+ggplot(dub, aes(fill = amount)) + geom_sf()
+```
+
+## Coombes and Bond algorithm
+
+To find the Dublin areas with the strongest commuting connections, I use the `findClusters()` function from `LabourMarketAreas`. Its main inputs are:
+
+- **LWCom**: the commuting dataset, showing how many people travel between each pair of areas.
+- **idcom_type**: whether the area codes are character strings (e.g. "02001") or numeric.
+- **minSZ**: the minimum population for an area to be a valid cluster.
+- **minSC**: the minimum self-containment, i.e. the lowest acceptable share of people who live and work in the same area.
+- **tarSZ**: the target population size for a cluster.
+- **tarSC**: the target self-containment for the final clusters, usually higher than minSC.
+
+**How the algorithm works:**
+
+1. Each community is ranked using the SZ and SC values and initially treated as a cluster.
+2. Lower-ranked communities are checked. If they meet the validation requirements, the algorithm stops.
+3. Otherwise, the lowest-ranked zones are split into smaller components.
+4. These components are joined to the nearby zones they are most connected to.
+5. SZ and SC are recalculated for the new clusters.
+6. Steps 1–5 repeat until the algorithm converges.
+
+**Steps of the analysis:** compute clusters with `findClusters()`, explore how the results change with different `tarSZ` and `tarSC` values while keeping `minSZ` and `minSC` fixed, and map the resulting TTWAs.
+
+### Baseline: target size 80,000, target self-containment 0.5
+
+The baseline aims for TTWAs of around 80,000 people, with at least 40% of people in each cluster living and working in the same area (minSC = 0.4, tarSC = 0.5). This is a reasonable threshold for Dublin's labour market.
+
+```{r baseline}
+dub <- left_join(dub, lookup, by = "community")
+
+dcluster <- findClusters(dub_trips, 15000, 0.4, 80000, 0.5, idcom_type = "char")
+head(dcluster$lma$clusterList)
+
+dclus_sf <- dub %>%
+  left_join(tibble(dcluster$lma$clusterList), by = "community") %>%
+  mutate(cluster = dub$name[cluster])
+
+ggplot(dclus_sf) +
+  geom_sf(col = "white", aes(fill = cluster)) +
+  scale_fill_brewer(palette = "Accent")
+```
+
+A helper function draws each cluster map with ED labels:
+
+```{r helper}
+plot_clusters <- function(clusters) {
+  csf <- dub %>%
+    left_join(tibble(clusters$lma$clusterList), by = "community") %>%
+    mutate(cluster = dub$name[cluster])
+
+  centroids <- st_centroid(csf)
+  labels <- cbind(centroids, st_coordinates(centroids)) |> st_drop_geometry()
+  labels$name <- iconv(csf$name, from = "UTF-8", to = "ASCII//TRANSLIT", sub = "")
+
+  ggplot(csf) +
+    geom_sf(aes(fill = cluster), col = "white") +
+    scale_fill_brewer(palette = "Accent") +
+    geom_label_repel(data = labels, aes(x = X, y = Y, label = name), size = 1.5)
+}
+```
+
+### Analysis 1: target size 100,000, target self-containment 0.75
+
+```{r analysis-1}
+v1 <- findClusters(dub_trips, 15000, 0.4, 100000, 0.75, idcom_type = "char")
+plot_clusters(v1)
+```
+
+Increasing the target population from 80,000 to 100,000 changes the clusters noticeably. The whole Balbriggan Rural area is absorbed into the larger Swords–Forrest cluster, showing how much a single parameter can change how regions are grouped.
+
+### Analysis 2: target size 150,000, target self-containment 0.8
+
+```{r analysis-2}
+v2 <- findClusters(dub_trips, 15000, 0.4, 150000, 0.8, idcom_type = "char")
+plot_clusters(v2)
+```
+
+With a target size of 150,000, the number of clusters drops to just three, and most areas fall under Swords–Forrest. Because each cluster must contain more people, smaller clusters merge and fewer distinct regions form.
+
+### Analysis 3: target size 60,000, target self-containment 0.4
+
+```{r analysis-3}
+v3 <- findClusters(dub_trips, 15000, 0.4, 60000, 0.4, idcom_type = "char")
+plot_clusters(v3)
+```
+
+Lowering the target size to 60,000 increases the number of clusters to eight, and some areas shift considerably. Balbriggan Rural loses nearly half its area to Skerries, and Swords–Forrest breaks up, with parts pulled into Swords–Lissenhall, Blanchardstown–Blakestown and Dún Laoghaire–Sallynoggin West.
+
+### Analysis 4: target size 20,000, target self-containment 0.8
+
+```{r analysis-4}
+v4 <- findClusters(dub_trips, 15000, 0.4, 20000, 0.8, idcom_type = "char")
+plot_clusters(v4)
+```
+
+With a target size of 20,000 the algorithm produces only four clusters, fewer than expected for such a small threshold. Swords–Forrest expands to absorb Dún Laoghaire–Sallynoggin West, and Lucan–Esker takes over much of Saggart. The high self-containment target likely forces the algorithm to form larger, more tightly connected zones.
+
+## Conclusion
+
+The Coombes and Bond method is highly sensitive to the target population size (tarSZ) and target self-containment (tarSC), which together shape the number and size of the TTWAs. Raising tarSZ sharply reduces the number of clusters, while lowering it does not always increase them, because the self-containment threshold also constrains the result. Adjusting tarSC changes how compact or spread out the clusters are. Even small parameter changes can lead to different interpretations of Dublin's commuting zones.
